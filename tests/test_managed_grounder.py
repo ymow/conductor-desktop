@@ -176,6 +176,62 @@ async def test_ground_402_raises_actionable_error():
     await g.close()
 
 
+def _counting(statuses, headers=None):
+    """A handler answering each request with the next status in turn; a 200
+    carries one candidate. ``calls`` counts the requests."""
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        status = statuses[min(len(calls) - 1, len(statuses) - 1)]
+        if status == 200:
+            return httpx.Response(200, json={"candidates": [
+                {"bbox": {"X1": 1, "Y1": 2, "X2": 3, "Y2": 4}, "description": "ok"}]})
+        return httpx.Response(status, headers=headers or {}, json={"error": "slow down"})
+
+    return handler, calls
+
+
+def _no_wait(g):
+    waits = []
+
+    async def sleep(s):
+        waits.append(s)
+
+    g._gw._sleep = sleep
+    return waits
+
+
+async def test_ground_429_is_retried_after_retry_after():
+    handler, calls = _counting([429, 200], headers={"Retry-After": "2"})
+    g = _grounder_with(handler)
+    waits = _no_wait(g)
+    els = await g.ground("img", "x")
+    assert len(calls) == 2 and waits == [2.0]
+    assert els[0].bbox == (1, 2, 3, 4)
+    await g.close()
+
+
+async def test_ground_429_that_persists_says_rate_limited():
+    handler, calls = _counting([429])
+    g = _grounder_with(handler)
+    waits = _no_wait(g)
+    with pytest.raises(GrounderError, match=r"429 Too Many Requests.*one at a time"):
+        await g.ground("img", "x")
+    assert len(calls) == 3 and waits == [1.0, 2.0]  # backoff without Retry-After
+    await g.close()
+
+
+@pytest.mark.parametrize("header, attempt, expected", [
+    ("3", 0, 3.0), ("60", 0, 5.0), ("-1", 0, 0.0),
+    ("Wed, 21 Oct 2026 07:28:00 GMT", 1, 2.0), (None, 0, 1.0),
+])
+def test_retry_after_is_honoured_and_capped(header, attempt, expected):
+    from conductor_desktop.managed import retry_after_seconds
+    r = httpx.Response(429, headers={"Retry-After": header} if header else {})
+    assert retry_after_seconds(r, attempt) == expected
+
+
 async def test_ground_500_raises_grounder_error():
     def handler(request):
         return httpx.Response(500, text="boom")

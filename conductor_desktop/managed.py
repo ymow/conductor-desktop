@@ -9,6 +9,7 @@ seat token, the timeouts, and the mapping from every failure mode to a
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 import httpx
@@ -16,6 +17,24 @@ import httpx
 from .grounder import CoordSpace, GrounderError
 
 log = logging.getLogger(__name__)
+
+# A 429 is retried this many times. Each wait follows the gateway's
+# Retry-After when it sends one (capped, so one call can't stall the agent),
+# else a short doubling backoff.
+RATE_LIMIT_RETRIES = 2
+RATE_LIMIT_MAX_WAIT = 5.0
+RATE_LIMIT_BACKOFF = 1.0
+
+
+def retry_after_seconds(r: httpx.Response, attempt: int) -> float:
+    """How long to wait before retrying a 429: Retry-After in seconds when the
+    gateway sends a usable one, else 1 s, 2 s, ...; never more than the cap."""
+    raw = r.headers.get("Retry-After", "").strip()
+    try:
+        wait = float(raw)
+    except ValueError:  # absent, or an HTTP date we don't parse
+        wait = RATE_LIMIT_BACKOFF * (2 ** attempt)
+    return min(max(wait, 0.0), RATE_LIMIT_MAX_WAIT)
 
 
 def gateway_bbox(b: object) -> tuple[int, int, int, int] | None:
@@ -61,12 +80,14 @@ class GatewayClient:
         self._owns_http = http is None
         self._http = http or httpx.AsyncClient(
             timeout=timeout, headers={"Authorization": f"Bearer {api_key}"})
+        self._sleep = asyncio.sleep  # swapped out in tests
 
     def borrow(self) -> GatewayClient:
         """A second view on this connection, for another capability. Closing
         the borrowed one leaves the pool to its owner."""
         view = GatewayClient(self.base, "", 0, what=self.what,
                              timeout_env=self._timeout_env, http=self._http)
+        view._sleep = self._sleep
         return view
 
     async def close(self) -> None:
@@ -80,10 +101,30 @@ class GatewayClient:
         that already catch ``RuntimeError`` keep working.
 
         Statuses in ``allow`` come back unraised: /v1/ground answers 404 for
-        an honest no-match.
+        an honest no-match. A 429 is waited out and retried a couple of
+        times before it becomes an error.
         """
+        for attempt in range(RATE_LIMIT_RETRIES + 1):
+            r = await self._post_once(path, payload)
+            if r.status_code != 429:
+                break
+            if attempt == RATE_LIMIT_RETRIES:
+                raise GrounderError(
+                    f"{self.what} returned 429 Too Many Requests — the gateway "
+                    f"is rate-limiting this API key (retried "
+                    f"{RATE_LIMIT_RETRIES} times). Send grounder calls (locate, "
+                    f"crop, read_screen, enumerate_elements, click by "
+                    f"description) one at a time, or wait a few seconds and "
+                    f"retry."
+                )
+            wait = retry_after_seconds(r, attempt)
+            log.info("%s rate-limited on %s; retrying in %.1fs", self.what, path, wait)
+            await self._sleep(wait)
+        return self._check(r, path, allow)
+
+    async def _post_once(self, path: str, payload: dict) -> httpx.Response:
         try:
-            r = await self._http.post(f"{self.base}{path}", json=payload)
+            return await self._http.post(f"{self.base}{path}", json=payload)
         except httpx.TimeoutException as e:
             raise GrounderError(
                 f"{self.what} timed out after {self._http.timeout.read}s "
@@ -96,6 +137,10 @@ class GatewayClient:
                 f"({type(e).__name__}: {e}). Check the gateway is up and "
                 f"CONDUCTOR_DESKTOP_GROUNDER_URL points at it."
             ) from e
+
+    def _check(self, r: httpx.Response, path: str,
+               allow: tuple[int, ...]) -> httpx.Response:
+        """Turn a non-2xx reply into a ``GrounderError`` naming the fix."""
         if r.status_code == 402:
             raise GrounderError(
                 f"{self.what} returned 402 Payment Required — the credit "
