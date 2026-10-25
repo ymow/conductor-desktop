@@ -142,7 +142,10 @@ def android(monkeypatch):
 async def test_android_type_text_reaches_input_intact(android, text):
     ex, sent = android
     assert (await ex.type_text(text)).success
-    assert _device_sh_argv(sent[0]) == ["input", "text", text.replace(" ", "%s")]
+    # type_text first reads the keyboard layout (settings, dumpsys); the text
+    # itself goes out in exactly one `input text` call.
+    typed = [_device_sh_argv(a) for a in sent if a[0] == "shell" and a[1:3] == ("input", "text")]
+    assert typed == [["input", "text", text.replace(" ", "%s")]]
 
 
 @pytest.mark.parametrize("key", ["home", "KEYCODE_HOME;reboot", "x $(reboot)"])
