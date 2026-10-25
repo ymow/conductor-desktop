@@ -89,6 +89,8 @@ class AndroidExecutor:
         self.serial = serial
         self._screen_w: int = 0
         self._screen_h: int = 0
+        # Seconds for the keyboard to apply a layout switch before re-reading.
+        self._layout_settle: float = 0.5
 
     # Patterns that indicate a device-side failure even though `adb shell`
     # exited 0. The `input` binary normally produces no stderr on success;
@@ -307,15 +309,87 @@ class AndroidExecutor:
 
         Note: input text loses non-ASCII reliably. For Unicode payloads,
         consider clipboard-paste via clipper or kbd helper apps.
+
+        A composing keyboard layout (Gboard Zhuyin, Pinyin, Japanese, ...)
+        takes the injected letters into its composition strip instead of
+        the field, and `input text` still exits 0. So before typing ASCII,
+        a layout that isn't ASCII-capable is cycled to one that is with
+        KEYCODE_LANGUAGE_SWITCH, and back afterwards; when no such layout
+        is reachable the reply warns instead of claiming the text landed.
         """
         try:
+            original, note = None, ""
+            if text.isascii():
+                original, note = await self._ensure_ascii_layout()
             # `input text` reads %s as a space; the rest is passed through.
             payload = text.replace(" ", "%s")
-            await self._adb_text("shell", *_sh_args("input", "text", payload))
-            return ActionResult(success=True, output=f"typed {len(text)} chars on {self.serial}")
+            try:
+                await self._adb_text("shell", *_sh_args("input", "text", payload))
+            finally:
+                if original is not None:
+                    note = await self._restore_layout(original)
+            out = f"typed {len(text)} chars on {self.serial}"
+            return ActionResult(success=True, output=f"{out}{note}")
         except Exception as e:
             log.debug("android type_text failed", exc_info=True)
             return ActionResult(success=False, error=_exc_str(e))
+
+    async def _layout(self) -> tuple[str, bool | None, list[str]]:
+        """``(subtype hash, ASCII-capable or None if unknown, the IME's enabled
+        subtype hashes)`` for the active keyboard."""
+        current = (await self._adb_text(
+            "shell", "settings", "get", "secure", "selected_input_method_subtype")).strip()
+        ime = (await self._adb_text(
+            "shell", "settings", "get", "secure", "default_input_method")).strip()
+        enabled = (await self._adb_text(
+            "shell", "settings", "get", "secure", "enabled_input_methods")).strip()
+        dump = await self._adb_text("shell", "dumpsys", "input_method", timeout=10)
+        return current, _subtype_ascii_capable(dump, current), _enabled_subtypes(enabled, ime)
+
+    async def _switch_layout(self) -> None:
+        await self._adb_text("shell", "input", "keyevent", "KEYCODE_LANGUAGE_SWITCH")
+        await asyncio.sleep(self._layout_settle)
+
+    async def _ensure_ascii_layout(self) -> tuple[str | None, str]:
+        """Cycle to an ASCII-capable layout if the active one isn't.
+        ``(the original hash to restore, or None; a note for the reply)``."""
+        try:
+            current, capable, enabled = await self._layout()
+        except Exception:  # a probe failure must not block typing
+            log.debug("android keyboard probe failed", exc_info=True)
+            return None, ""
+        if capable is not False:
+            return None, ""
+        original = current
+        for _ in range(max(len(enabled), 1)):
+            await self._switch_layout()
+            current, capable, _ = await self._layout()
+            if capable:
+                return original, ""
+            if current == original:
+                break  # wrapped round, or the keyboard isn't up to take the switch
+        if current != original:
+            await self._restore_layout(original)
+        return None, (
+            " — warning: the active keyboard layout composes (it isn't "
+            "ASCII-capable), so the text likely sits in its composition strip, "
+            "not the field. Tap the field so the keyboard is up, or switch the "
+            "phone's keyboard to an English layout, then retry."
+        )
+
+    async def _restore_layout(self, original: str) -> str:
+        """Cycle back to ``original``; a note saying whether it took."""
+        try:
+            _, _, enabled = await self._layout()
+            for _ in range(max(len(enabled), 1)):
+                await self._switch_layout()
+                current, _, _ = await self._layout()
+                if current == original:
+                    return " (switched to an ASCII keyboard layout for this and back)"
+        except Exception:  # the text is typed; only the note is at stake
+            log.debug("android keyboard restore failed", exc_info=True)
+        return (" (switched to an ASCII keyboard layout for this; switching back "
+                "failed, so the phone's keyboard is left on it)")
 
     async def key_press(self, key: str) -> ActionResult:
         keycode = _android_keycode(key)
@@ -400,6 +474,25 @@ def _summarize_activities(dumpsys: str) -> dict:
             seen.add((component, task))
             stack.append({"activity": component, "task": int(task)})
     return {"resumed": resumed.group(1) if resumed else None, "activities": stack[:20]}
+
+
+def _subtype_ascii_capable(dump: str, subtype_hash: str) -> bool | None:
+    """Whether the keyboard subtype with this hash is ASCII-capable, read from
+    ``dumpsys input_method``; None when the dump doesn't list it."""
+    if not subtype_hash or subtype_hash in ("-1", "null"):
+        return None
+    m = re.search(rf"mIsAsciiCapable=(true|false) mSubtypeHashCode={re.escape(subtype_hash)}\b", dump)
+    return None if m is None else m.group(1) == "true"
+
+
+def _enabled_subtypes(enabled: str, ime: str) -> list[str]:
+    """The subtype hashes enabled for ``ime`` in the ``enabled_input_methods``
+    setting (``ime;hash;hash:other_ime;hash``)."""
+    for entry in enabled.split(":"):
+        name, *hashes = entry.split(";")
+        if name == ime:
+            return [h for h in hashes if h]
+    return []
 
 
 def _sh_args(*args: str) -> list[str]:

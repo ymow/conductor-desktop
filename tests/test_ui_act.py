@@ -228,6 +228,39 @@ def test_select_can_verify_through_another_element():
     assert out.verification == "verified" and row.selected
 
 
+class _RadioGroup(Fake):
+    """Finder's toolbar view buttons: AXPress picks one, the state shows in
+    AXValue (``checked``), and there is no AXSelected to read."""
+
+    def perform(self, el, verb, node, params):
+        self.performed.append((el, verb, params))
+        if self.inert:
+            return Effect()
+        for sib in el.parent.kids:
+            sib.checked = 1 if sib is el else 0
+        return Effect()
+
+
+def _view_buttons():
+    radios = [El("AXRadioButton", name=n, actions=["AXPress"], checked=int(n == "list view"))
+              for n in ("icon view", "list view", "column view")]
+    tree(*radios)
+    return radios
+
+
+def test_radio_select_verifies_through_checked():
+    column = _view_buttons()[2]
+    out = run_action(_RadioGroup(), column, _node(column, (2,)), "select", {})
+    assert (out.verification, out.detail) == ("verified", "now selected")
+
+
+def test_radio_select_that_does_not_take_is_still_a_mismatch():
+    column = _view_buttons()[2]
+    out = run_action(_RadioGroup(inert=True), column, _node(column, (2,)), "select", {},
+                     settle=0, sleep=lambda s: None)
+    assert out.verification == "mismatch" and out.detail.startswith("not selected")
+
+
 def test_press_is_unverified():
     save = save_button()
     out = run_action(Fake(), save, _node(save), "press", {})
