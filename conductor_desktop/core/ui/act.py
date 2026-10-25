@@ -85,7 +85,14 @@ def _expectation(verb: str, node: UINode, params: dict):
         return (lambda n: ("checked" in n.states) == target and "mixed" not in n.states,
                 f"now {want}", lambda n: f"still {word(n)} {wait}")
     if verb == "select":
-        return (lambda n: "selected" in n.states, "now selected", lambda n: f"not selected {wait}")
+        # A radio reports its selection as "checked" (macOS AXValue, Windows
+        # ToggleState), not "selected": Finder's view buttons have no
+        # AXSelected at all, so checking only "selected" called every
+        # successful radio select a mismatch.
+        def picked(n: UINode) -> bool:
+            return "selected" in n.states or (n.role == "radio" and "checked" in n.states)
+
+        return (picked, "now selected", lambda n: f"not selected {wait}")
     if verb == "expand":
         target = bool(params.get("expand", True))
         word = "expanded" if target else "collapsed"
